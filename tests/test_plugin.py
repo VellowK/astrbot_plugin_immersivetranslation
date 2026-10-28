@@ -128,6 +128,7 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
             get_current_chat_provider_id=AsyncMock(return_value="test-provider"),
         )
         self.plugin = plugin_module.ImmersiveTranslationPlugin(self.context, {})
+        self.plugin.runtime.ensure = AsyncMock(return_value="not-executed")
         self.addAsyncCleanup(self.plugin.terminate)
         # Most tests need deterministic job dispatch, not the maintenance timer.
         cleaner_patch = patch.object(self.plugin, "_start_cleaner")
@@ -524,7 +525,6 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
             patch.object(self.plugin, "_source", AsyncMock(return_value=source)),
             patch.object(plugin_module, "ModelBridge", return_value=manager),
             patch.object(plugin_module, "run_engine", side_effect=engine),
-            patch.object(plugin_module, "python_path", return_value="not-executed"),
         ):
             await self.plugin._job(event, self.attachment, "ja", directory)
         self.assertFalse((directory / "request.json").exists())
@@ -602,29 +602,95 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(self.plugin, "_source", AsyncMock(return_value=directory / "source.pdf")):
             await self.plugin._job(event, self.attachment, "zh", directory)
         self.assertIn("未配置文本模型", event.sent[0])
+        self.plugin.runtime.ensure.assert_not_awaited()
 
-    async def test_status_reports_engine_error_without_starting_job(self):
+    async def test_job_ensures_runtime_before_opening_model_bridge(self):
+        observed = []
+
+        async def ensure(config, notify):
+            observed.append("setup")
+            await notify("正在准备隔离引擎")
+            return "not-executed"
+
+        self.plugin.runtime.ensure.side_effect = ensure
+        event, _, request = await self.run_real_job()
+        self.plugin.runtime.ensure.assert_awaited_once()
+        self.assertEqual(observed, ["setup"])
+        self.assertEqual(event.sent[0], "正在准备隔离引擎")
+        self.assertEqual(request["model"], "astrbot")
+
+    async def test_setup_failure_does_not_open_bridge_or_download_document(self):
+        directory = self.plugin.root / ("job_" + "d" * 32)
+        directory.mkdir()
+        self.plugin.runtime.ensure.side_effect = TranslationError("引擎下载失败，请检查网络。")
+        event = self.event(self.attachment)
         with (
-            patch.object(plugin_module, "python_path", return_value="not-executed"),
-            patch.object(
-                plugin_module,
-                "check_engine",
-                AsyncMock(side_effect=TranslationError("engine missing")),
-            ),
+            patch.object(plugin_module, "ModelBridge") as bridge,
+            patch.object(self.plugin, "_source", new_callable=AsyncMock) as source,
+        ):
+            await self.plugin._job(event, self.attachment, "zh", directory)
+        bridge.assert_not_called()
+        source.assert_not_awaited()
+        self.assertEqual(event.sent, ["引擎下载失败，请检查网络。"])
+        self.assertFalse((directory / "request.json").exists())
+        self.assertFalse(self.plugin.jobs)
+
+    async def test_cancel_during_setup_cleans_job_and_does_not_start_translation(self):
+        entered = asyncio.Event()
+        cancelled = asyncio.Event()
+
+        async def ensure(config, notify):
+            entered.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cancelled.set()
+
+        self.plugin.runtime.ensure.side_effect = ensure
+        with patch.object(plugin_module, "ModelBridge") as bridge:
+            event = self.event(self.attachment)
+            await self.plugin._launch(event)
+            await entered.wait()
+            reply = await self.run_message(Plain("/沉浸翻译 取消"))
+        self.assertTrue(cancelled.is_set())
+        self.assertFalse(self.plugin.jobs)
+        self.assertFalse(self.plugin.active_directories)
+        bridge.assert_not_called()
+        self.assertIn("已取消", reply.sent[0])
+
+    async def test_managed_status_is_read_only_and_reports_preparation(self):
+        with (
+            patch.object(self.plugin.runtime, "describe", return_value="正在安装引擎") as describe,
+            patch.object(asyncio, "create_subprocess_exec", new_callable=AsyncMock) as check,
         ):
             event = await self.run_message(Plain("/沉浸翻译 状态"))
-        self.assertEqual(event.sent, ["engine missing"])
+        describe.assert_called_once_with(self.plugin.config)
+        check.assert_not_awaited()
+        self.plugin.runtime.ensure.assert_not_awaited()
+        self.assertIn("正在安装引擎", event.sent[0])
+        self.assertFalse(self.plugin.jobs)
+
+    async def test_manual_status_is_read_only_and_does_not_validate(self):
+        self.plugin.config["engine_python"] = sys.executable
+        with patch.object(asyncio, "create_subprocess_exec", new_callable=AsyncMock) as spawn:
+            event = await self.run_message(Plain("/沉浸翻译 状态"))
+        spawn.assert_not_awaited()
+        self.plugin.runtime.ensure.assert_not_awaited()
+        self.assertIn("手动引擎：待自检", event.sent[0])
+        self.assertFalse((self.plugin.root.parent / "engine_home").exists())
         self.assertFalse(self.plugin.jobs)
 
     async def test_status_does_not_launch_concurrent_engine_checks(self):
-        await self.plugin.check_lock.acquire()
-        try:
-            with patch.object(plugin_module, "check_engine", new_callable=AsyncMock) as check:
-                event = await self.run_message(Plain("/沉浸翻译 状态"))
-                check.assert_not_awaited()
-        finally:
-            self.plugin.check_lock.release()
-        self.assertIn("自检正在进行", event.sent[0])
+        self.plugin.config["engine_python"] = sys.executable
+        with patch.object(asyncio, "create_subprocess_exec", new_callable=AsyncMock) as spawn:
+            one, two = await asyncio.gather(
+                self.run_message(Plain("/沉浸翻译 状态")),
+                self.run_message(Plain("/沉浸翻译 状态")),
+            )
+        spawn.assert_not_awaited()
+        self.plugin.runtime.ensure.assert_not_awaited()
+        self.assertEqual(one.sent, two.sent)
+        self.assertIn("待自检", one.sent[0])
 
 
 class IntegerTests(unittest.TestCase):

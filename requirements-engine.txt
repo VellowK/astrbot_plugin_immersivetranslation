@@ -4,5 +4,5 @@ pdf2zh-next==2.9.0
 Pillow>=10,<12
 # BabelDOC 0.6.x imports BitStream, removed in bitstring 5.
 bitstring>=4.3,<5
-# Keep the upstream PyMuPDF constraint explicit for reproducibility/compatibility.
-PyMuPDF<1.25.3
+# Preserve upstream's ceiling; older builds misextract the CJK OCR text layer.
+PyMuPDF>=1.25.2,<1.25.3

@@ -19,7 +19,8 @@ from astrbot.core.utils.astrbot_path import get_astrbot_data_path
 from .bridge import ModelBridge
 from .download import download, safe_name
 from .errors import TranslationError
-from .process import check_engine, python_path, run_engine
+from .process import run_engine
+from .runtime import EngineRuntime
 
 try:
     from asyncio import timeout
@@ -33,7 +34,8 @@ HELP = """沉浸式文档翻译 · BabelDOC 开源引擎
 支持模型工具 immersive_translate，使用当前或同一用户最近发送的附件，不接受任意路径。
 默认英→中，返回译文及双语 PDF。图片和扫描件需开启可选 OCR，仅适合清晰黑字白底，图片输出为 PDF。
 使用 AstrBot 当前文本模型，会产生模型费用；原文发送至该模型服务。原文件不覆盖，不保证无损排版。
-首次使用请先按 README 安装独立引擎。与沉浸式翻译官方无隶属关系，不使用会员账号/额度。"""
+首次翻译自动联网准备隔离引擎，无需填写 engine_python；可能较慢，可用「状态」查看、「取消」中止。
+与沉浸式翻译官方无隶属关系，不使用会员账号/额度。"""
 
 
 def integer(config, key, default, minimum, maximum):
@@ -61,7 +63,7 @@ class ImmersiveTranslationPlugin(Star):
         self.root.mkdir(parents=True, exist_ok=True)
         self.cleaner = None
         self.closing = False
-        self.check_lock = asyncio.Lock()
+        self.runtime = EngineRuntime(self.root.parent)
 
     def _key(self, event):
         return event.unified_msg_origin, str(event.get_sender_id())
@@ -165,17 +167,25 @@ class ImmersiveTranslationPlugin(Star):
 
     async def _job(self, event, component, target, directory):
         try:
-            async with timeout(integer(self.config, "job_timeout", 1800, 60, 7200)):
-                source = await self._source(component, directory)
-                provider = str(self.config.get("provider_id", "")).strip()
-                if not provider:
+            # Reject missing model configuration before a potentially large engine download.
+            provider = str(self.config.get("provider_id", "")).strip()
+            if not provider:
+                async with timeout(integer(self.config, "model_timeout", 120, 10, 600)):
                     provider = await self.context.get_current_chat_provider_id(
                         event.unified_msg_origin
                     )
-                if not provider:
-                    raise TranslationError(
-                        "当前会话未配置文本模型，请设置 provider_id 或选择 AstrBot 模型。"
-                    )
+            if not provider:
+                raise TranslationError(
+                    "当前会话未配置文本模型，请设置 provider_id 或选择 AstrBot 模型。"
+                )
+
+            async def setup_notice(message):
+                await event.send(event.plain_result(message))
+
+            # Setup has its own timeout; it must not consume the translation time budget.
+            python = await self.runtime.ensure(self.config, notify=setup_notice)
+            async with timeout(integer(self.config, "job_timeout", 1800, 60, 7200)):
+                source = await self._source(component, directory)
                 async with ModelBridge(
                     self.context,
                     provider,
@@ -197,7 +207,6 @@ class ImmersiveTranslationPlugin(Star):
                         "qps": 1,
                         "table": False,
                     }
-                    python = python_path(self.config)
                     request_path = directory / "request.json"
                     request_path.write_text(json.dumps(request, ensure_ascii=False), "utf-8")
                     if os.name != "nt":
@@ -291,7 +300,7 @@ class ImmersiveTranslationPlugin(Star):
         task = asyncio.create_task(self._job(event, attachments[0], language, directory))
         self.jobs[key] = task
         task.add_done_callback(lambda finished: self._task_done(key, directory, finished))
-        return "翻译任务已启动，完成后会自动发送译本；/沉浸翻译 取消 可中止。原文会发送至配置的模型并可能计费。"
+        return "翻译任务已启动；首次使用将自动联网准备引擎。完成后自动发送译本；/沉浸翻译 状态 可查看，/沉浸翻译 取消 可中止。原文会发送至配置的模型并可能计费。"
 
     def _task_done(self, key, directory, task):
         if self.jobs.get(key) is task:
@@ -346,28 +355,13 @@ class ImmersiveTranslationPlugin(Star):
                     )
                 )
             elif argument in {"状态", "status"}:
-                if self.check_lock.locked():
-                    await event.send(event.plain_result("引擎自检正在进行。"))
-                    return
-                try:
-                    async with self.check_lock:
-                        result = await check_engine(
-                            python_path(self.config), self.root.parent / "engine_home"
-                        )
-                    message = f"引擎{'可用' if result.get('ok') else '未就绪'}；pdf2zh-next：{result.get('pdf2zh_next') or '未安装'}；运行任务：{len(self.jobs)}。"
-                    if result.get("errors"):
-                        message += "\n" + "\n".join(
-                            str(item)[:300] for item in result["errors"][:4]
-                        )
-                    await event.send(event.plain_result(message))
-                except Exception as exc:
-                    await event.send(
-                        event.plain_result(
-                            str(exc)
-                            if isinstance(exc, TranslationError)
-                            else "引擎自检失败，请检查 engine_python。"
-                        )
+                # Both modes are read-only: imports/self-checks can create
+                # upstream caches, so only a translation may start an interpreter.
+                await event.send(
+                    event.plain_result(
+                        self.runtime.describe(self.config) + f"；运行任务：{len(self.jobs)}。"
                     )
+                )
             elif argument in {"", "翻译", "开始"}:
                 await event.send(event.plain_result(await self._launch(event)))
             else:
