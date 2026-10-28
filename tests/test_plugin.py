@@ -163,10 +163,12 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.plugin.recent[self.plugin._key(original)][1], self.attachment)
         with patch.object(self.plugin, "_job", side_effect=self.hold_job) as job:
             for user, session in (("bob", "group:one"), ("alice", "group:two")):
-                other = self.event(user=user, session=session)
+                other = self.event(Plain("翻译"), user=user, session=session)
                 self.assertIn("120秒", await self.plugin.immersive_translate(other))
                 job.assert_not_called()
-            response = await self.plugin.immersive_translate(self.event(session="group:one"))
+            response = await self.plugin.immersive_translate(
+                self.event(Plain("翻译"), session="group:one")
+            )
             self.assertIn("已启动", response)
             self.assertIs(job.call_args.args[1], self.attachment)
         self.assertNotIn(self.plugin._key(original), self.plugin.recent)
@@ -195,12 +197,132 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(event.sent)
         self.assertIn(self.plugin._key(event), self.plugin.recent)
 
-    async def test_auto_mode_launches_supported_attachment(self):
-        with patch.object(self.plugin, "_launch", AsyncMock(return_value="started")) as launch:
-            event = await self.run_message(self.attachment)
-        launch.assert_awaited_once_with(event)
+    async def test_bare_attachments_never_launch_even_with_legacy_auto_enabled(self):
+        for config in (
+            {},
+            {"auto_translate_attachment": True},
+            {"auto_translate_attachment": False},
+        ):
+            self.plugin.config = config
+            for attachment in (self.attachment, Image(file="image.png")):
+                with self.subTest(config=config, attachment=type(attachment).__name__):
+                    with patch.object(self.plugin, "_launch", new_callable=AsyncMock) as launch:
+                        event = await self.run_message(attachment)
+                    launch.assert_not_awaited()
+                    self.assertFalse(event.stopped)
+                    self.assertFalse(event.sent)
+                    self.assertIn(self.plugin._key(event), self.plugin.recent)
+        self.plugin.runtime.ensure.assert_not_awaited()
+        self.assertEqual(list(self.plugin.root.iterdir()), [])
+
+    async def test_natural_requests_launch_with_requested_language(self):
+        for text, language in (
+            ("翻译", ""),
+            ("帮我翻译一下这个文件", ""),
+            ("把刚才那份PDF翻译成日语", "ja"),
+        ):
+            with self.subTest(text=text):
+                with patch.object(
+                    self.plugin, "_launch", AsyncMock(return_value="started")
+                ) as launch:
+                    event = await self.run_message(Plain(text), self.attachment)
+                launch.assert_awaited_once_with(event, language)
+                self.assertTrue(event.stopped)
+                self.assertEqual(event.sent, ["started"])
+
+    async def test_send_pdf_then_say_translate_reuses_same_users_attachment(self):
+        await self.run_message(self.attachment)
+        with patch.object(self.plugin, "_job", side_effect=self.hold_job) as job:
+            event = await self.run_message(Plain("帮我翻译一下这个文件"))
         self.assertTrue(event.stopped)
-        self.assertEqual(event.sent, ["started"])
+        self.assertIs(job.call_args.args[1], self.attachment)
+        self.assertEqual(job.call_args.args[2], "zh")
+
+    async def test_natural_request_without_attachment_waits_for_next_pdf(self):
+        request = await self.run_message(Plain("帮我翻译一下"))
+        self.assertIn("120秒", request.sent[0])
+        with patch.object(self.plugin, "_job", side_effect=self.hold_job) as job:
+            await self.run_message(self.attachment)
+        self.assertIs(job.call_args.args[1], self.attachment)
+
+    async def test_unrequested_tool_call_cannot_start_or_create_pending(self):
+        for parts in (
+            (),
+            (self.attachment,),
+            (Plain("帮我总结这个文件"), self.attachment),
+            (Plain("翻译插件怎么用"),),
+            (Plain("这是PDF"), self.attachment),
+            (Plain("可以翻译这个PDF吗？"), self.attachment),
+            (Plain("把hello翻译成中文"), self.attachment),
+            (Plain("翻译这个PDF，仅讨论可行性"), self.attachment),
+        ):
+            with self.subTest(parts=parts):
+                with patch.object(self.plugin, "_launch", new_callable=AsyncMock) as launch:
+                    result = await self.plugin.immersive_translate(self.event(*parts), "ja")
+                self.assertIn("明确", result)
+                launch.assert_not_awaited()
+                self.assertFalse(self.plugin.pending)
+        self.plugin.runtime.ensure.assert_not_awaited()
+
+    async def test_tool_allows_clear_request_but_not_help_status_or_cancel_commands(self):
+        event = self.event(Plain("帮我翻译这个文件"), self.attachment)
+        with patch.object(self.plugin, "_launch", AsyncMock(return_value="started")) as launch:
+            self.assertEqual(await self.plugin.immersive_translate(event, "ja"), "started")
+        launch.assert_awaited_once_with(event, "ja")
+        for action in ("状态", "帮助", "取消"):
+            result = await self.plugin.immersive_translate(self.event(Plain("/沉浸翻译 " + action)))
+            self.assertIn("明确", result)
+
+    async def test_refusal_clears_pending_and_blocks_message_and_tool(self):
+        for text in (
+            "先别翻译",
+            "这个文件不用翻译",
+            "不要翻译，帮我总结",
+            "翻译一下这个文件，但不要开始",
+            "翻译一下这个文件，不用了",
+            "帮我翻译这个文件，算了不用了",
+        ):
+            event = self.event(Plain(text), self.attachment)
+            key = self.plugin._key(event)
+            self.plugin.pending[key] = float("inf")
+            self.plugin.pending_languages[key] = "ja"
+            with patch.object(self.plugin, "_launch", new_callable=AsyncMock) as launch:
+                await self.plugin.on_message(event)
+                self.assertIn("明确", await self.plugin.immersive_translate(event))
+            launch.assert_not_awaited()
+            self.assertFalse(event.stopped)
+            self.assertNotIn(key, self.plugin.pending)
+            self.assertNotIn(key, self.plugin.pending_languages)
+
+    async def test_pending_does_not_authorize_unrelated_caption_or_attachmentless_tool(self):
+        key = self.plugin._key(self.event())
+        self.plugin.pending[key] = float("inf")
+        with patch.object(self.plugin, "_launch", new_callable=AsyncMock) as launch:
+            event = await self.run_message(Plain("帮我总结这个文件"), self.attachment)
+            self.assertIn("明确", await self.plugin.immersive_translate(event))
+            self.assertIn("明确", await self.plugin.immersive_translate(self.event()))
+        launch.assert_not_awaited()
+        self.assertFalse(event.stopped)
+
+    async def test_capability_discussion_does_not_launch_message_handler(self):
+        for text in (
+            "可以翻译这个PDF吗？",
+            "翻译一下这个文件需要付费吗？",
+            "翻译这个PDF，仅讨论可行性",
+            "把hello翻译成中文",
+        ):
+            with self.subTest(text=text):
+                with patch.object(self.plugin, "_launch", new_callable=AsyncMock) as launch:
+                    event = await self.run_message(Plain(text), self.attachment)
+                launch.assert_not_awaited()
+                self.assertFalse(event.stopped)
+                self.assertFalse(event.sent)
+
+    async def test_explicit_user_target_cannot_be_overridden_by_tool_argument(self):
+        event = self.event(Plain("帮我翻译这个文件成日语"), self.attachment)
+        with patch.object(self.plugin, "_launch", AsyncMock(return_value="started")) as launch:
+            await self.plugin.immersive_translate(event, "fr")
+        launch.assert_awaited_once_with(event, "ja")
 
     async def test_pending_request_launches_even_when_auto_disabled(self):
         self.plugin.config["auto_translate_attachment"] = False
@@ -215,7 +337,7 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_tool_followup_preserves_requested_language(self):
         self.plugin.config["auto_translate_attachment"] = False
-        event = self.event()
+        event = self.event(Plain("帮我翻译一下"))
         self.assertIn("120秒", await self.plugin.immersive_translate(event, "ja"))
         with patch.object(self.plugin, "_job", side_effect=self.hold_job) as job:
             await self.run_message(self.attachment)
@@ -341,7 +463,7 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         parameters = inspect.signature(self.plugin.immersive_translate).parameters
         self.assertEqual(list(parameters), ["event", "target_language"])
         self.assertIn(
-            "120秒", await self.plugin.immersive_translate(self.event(Plain("C:/secret.pdf")))
+            "明确", await self.plugin.immersive_translate(self.event(Plain("C:/secret.pdf")))
         )
 
     async def test_invalid_language_does_not_create_job_or_consume_recent(self):

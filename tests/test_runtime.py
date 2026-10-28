@@ -21,6 +21,16 @@ module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(module)
 
 
+class ChunkedStream:
+    """Force reader boundaries rather than relying on StreamReader buffering."""
+
+    def __init__(self, chunks):
+        self.chunks = iter(chunks)
+
+    async def read(self, size):
+        return next(self.chunks, b"")
+
+
 class FakeProcess:
     def __init__(self, stdout=b"", stderr=b"", code=0, gate=None):
         self.stdout = asyncio.StreamReader()
@@ -324,6 +334,130 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
             await self.runtime.ensure({})
         self.assertNotIn("secret", str(caught.exception))
         self.assertFalse(self.runtime.ready.exists())
+
+    async def test_distribution_and_build_failure_include_safe_actionable_context(self):
+        self.fail_phase = "pip"
+        for failure in (
+            b"ERROR: No matching distribution found for pdf2zh-next==2.9.0\n",
+            b"ERROR: Could not find a version that satisfies the requirement pdf2zh-next==2.9.0\n",
+            b"  ERROR: Failed building wheel for pdf2zh-next\n",
+            b"Failed to build pdf2zh-next\n",
+        ):
+            with self.subTest(failure=failure):
+                self.fail_output = failure + b"https://user:password@index.invalid/secret-token\n"
+                with (
+                    patch.object(module.sys, "platform", "linux"),
+                    patch.object(module.sys, "maxsize", 2**63 - 1),
+                    patch.object(module.platform, "machine", return_value="aarch64"),
+                    self.assertRaises(module.TranslationError) as caught,
+                ):
+                    await self.runtime.ensure({})
+                text = str(caught.exception)
+                for expected in (
+                    "Python 3.12.0",
+                    "Linux/ARM64",
+                    "Python 64 位",
+                    "runtime/setup.log",
+                    "engine_python",
+                    "已识别的失败依赖：pdf2zh-next",
+                    "编译工具及系统库",
+                    "不要仅凭此提示更改依赖版本",
+                    "脱敏",
+                ):
+                    self.assertIn(expected, text)
+                for private in ("password", "index.invalid", "secret-token", "https://"):
+                    self.assertNotIn(private, text)
+                    self.assertNotIn(private, self.runtime.describe({}))
+                self.assertFalse(self.runtime.ready.exists())
+
+    async def test_network_failure_precedes_downstream_distribution_error(self):
+        self.fail_phase = "pip"
+        self.fail_output = (
+            b"WARNING: ProxyError('Cannot connect to proxy.', "
+            b"'https://user:password@proxy.invalid/secret-token')\n"
+            b"ERROR: Could not find a version that satisfies the requirement pdf2zh-next\n"
+            b"ERROR: No matching distribution found for pdf2zh-next\n"
+        )
+        with self.assertRaises(module.TranslationError) as caught:
+            await self.runtime.ensure({})
+        text = str(caught.exception)
+        self.assertIn("先检查网络", text)
+        self.assertIn("不能据此判断", text)
+        self.assertNotIn("已识别的失败依赖", text)
+        for private in ("password", "proxy.invalid", "secret-token", "https://"):
+            self.assertNotIn(private, text)
+        self.assertIn(self.fail_output, (self.runtime.directory / "setup.log").read_bytes())
+
+    async def test_benign_network_words_do_not_misclassify_distribution_failure(self):
+        self.fail_phase = "pip"
+        self.fail_output = (
+            b"Collecting networkx; Downloading proxy_helper.whl connection_pool.whl\n"
+            b"Looking in indexes: https://user:password@network.proxy.invalid/certificate\n"
+            b"ERROR: No matching distribution found for pdf2zh-next==2.9.0\n"
+        )
+        with self.assertRaises(module.TranslationError) as caught:
+            await self.runtime.ensure({})
+        self.assertIn("架构", str(caught.exception))
+        self.assertNotIn("先检查网络", str(caught.exception))
+        self.assertNotIn("password", str(caught.exception))
+
+    async def test_error_tokens_and_package_lines_survive_chunk_boundaries(self):
+        self.runtime.directory.mkdir(parents=True)
+        self.spawn.side_effect = None
+        for failure, expected in (
+            (b"ERROR: No matching distribution found for pdf2zh-next==2.9.0", "已识别的失败依赖"),
+            (b"ERROR: Failed building wheel for pdf2zh-next", "已识别的失败依赖"),
+            (b"ProxyError: Cannot connect to proxy", "先检查网络"),
+            (b"Read timed out", "先检查网络"),
+            (b"CERTIFICATE_VERIFY_FAILED", "先检查网络"),
+            (b"No module named ensurepip", "venv/ensurepip"),
+        ):
+            with self.subTest(failure=failure):
+                child = FakeProcess(code=1)
+                child.stderr = ChunkedStream([bytes([byte]) for byte in failure])
+                self.spawn.return_value = child
+                with self.assertRaisesRegex(module.TranslationError, expected):
+                    await self.runtime._run(["fake"], "pip")
+                self.assertEqual((self.runtime.directory / "setup.log").read_bytes(), failure)
+
+    async def test_stdout_and_stderr_fragments_are_not_joined_into_error_tokens(self):
+        self.runtime.directory.mkdir(parents=True)
+        child = FakeProcess(stdout=b"Proxy", stderr=b"Error\n", code=1)
+        self.spawn.side_effect = None
+        self.spawn.return_value = child
+        with self.assertRaises(module.TranslationError) as caught:
+            await self.runtime._run(["fake"], "pip")
+        self.assertNotIn("先检查网络", str(caught.exception))
+
+    async def test_arbitrary_and_url_package_candidates_are_never_public(self):
+        self.fail_phase = "pip"
+        for candidate in (
+            b"secret-password",
+            b"https://user:password@index.invalid/secret-token",
+            b"pdf2zh-next-secret-password",
+        ):
+            with self.subTest(candidate=candidate):
+                self.fail_output = b"ERROR: No matching distribution found for " + candidate
+                with self.assertRaises(module.TranslationError) as caught:
+                    await self.runtime.ensure({})
+                self.assertNotIn("已识别的失败依赖", str(caught.exception))
+                self.assertNotIn("password", str(caught.exception))
+                self.assertNotIn("index.invalid", str(caught.exception))
+
+    async def test_environment_hint_uses_allowlisted_architecture_and_python_bitness(self):
+        self.fail_phase = "pip"
+        for machine, expected in (("AMD64", "x86_64"), ("secret-password", "未知架构")):
+            with (
+                patch.object(module.sys, "platform", "win32"),
+                patch.object(module.sys, "maxsize", 2**31 - 1),
+                patch.object(module.platform, "machine", return_value=machine),
+                self.assertRaises(module.TranslationError) as caught,
+            ):
+                await self.runtime.ensure({})
+            text = str(caught.exception)
+            self.assertIn(f"Windows/{expected}", text)
+            self.assertIn("Python 32 位", text)
+            self.assertNotIn("secret-password", text)
 
     async def test_validation_failure_invalidates_cached_marker(self):
         await self.runtime.ensure({})
@@ -635,6 +769,86 @@ asyncio.run(main())
         self.spawn.return_value = child
         with self.assertRaises(module.TranslationError):
             await self.runtime._run(["fake"], "check", True)
+
+    async def test_bounded_log_keeps_final_failure_instead_of_only_prefix(self):
+        self.fail_phase = "pip"
+        final_error = b"ERROR: No matching distribution found for pdf2zh-next==2.9.0\n"
+        self.fail_output = (
+            b"initial-secret\n" + b"x" * (module._LOG_LIMIT * 2) + b"\n" + final_error
+        )
+        with self.assertRaisesRegex(module.TranslationError, "已识别的失败依赖"):
+            await self.runtime.ensure({})
+        log = self.runtime.directory / "setup.log"
+        retained = log.read_bytes()
+        self.assertEqual(len(retained), module._LOG_LIMIT)
+        self.assertTrue(retained.endswith(final_error))
+        self.assertNotIn(b"initial-secret", retained)
+        prefix = b"installing\n"
+        self.assertTrue(retained.startswith(prefix))
+        self.assertEqual(
+            retained[len(prefix) :], self.fail_output[-(module._LOG_LIMIT - len(prefix)) :]
+        )
+        if os.name != "nt":
+            self.assertEqual(log.stat().st_mode & 0o777, 0o600)
+
+    async def test_bounded_log_retains_both_stream_ends_despite_reader_order(self):
+        self.runtime.directory.mkdir(parents=True)
+        final_error = b"\nERROR: Failed building wheel for pdf2zh-next\n"
+        child = FakeProcess(code=1)
+        stderr_drained = asyncio.Event()
+        child.stderr = ChunkedStream([b"e" * 8192] * 256 + [final_error])
+        original_read = child.stderr.read
+
+        async def stderr_read(size):
+            chunk = await original_read(size)
+            if not chunk:
+                stderr_drained.set()
+            return chunk
+
+        stdout = ChunkedStream([b"o" * 8192] * 256 + [b"stdout-final-line\n"])
+
+        async def stdout_read(size):
+            await stderr_drained.wait()
+            return await stdout.read(size)
+
+        child.stderr.read = stderr_read
+        child.stdout.read = stdout_read
+        self.spawn.side_effect = None
+        self.spawn.return_value = child
+        with self.assertRaisesRegex(module.TranslationError, "已识别的失败依赖"):
+            await self.runtime._run(["fake"], "pip")
+        retained = (self.runtime.directory / "setup.log").read_bytes()
+        self.assertEqual(len(retained), module._LOG_LIMIT)
+        self.assertIn(b"stdout-final-line\n", retained)
+        self.assertTrue(retained.endswith(final_error))
+
+    async def test_log_finalizes_bounded_tail_on_cancellation(self):
+        self.runtime.directory.mkdir(parents=True)
+        child = FakeProcess(
+            stderr=b"x" * (module._LOG_LIMIT * 2) + b"private-final-line",
+            gate=asyncio.Event(),
+        )
+        self.spawn.side_effect = None
+        self.spawn.return_value = child
+        drained = asyncio.Event()
+        original_read = child.stderr.read
+
+        async def read(size):
+            chunk = await original_read(size)
+            if not chunk:
+                drained.set()
+            return chunk
+
+        child.stderr.read = read
+        task = asyncio.create_task(self.runtime._run(["fake"], "pip"))
+        await drained.wait()
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        log = (self.runtime.directory / "setup.log").read_bytes()
+        self.assertEqual(len(log), module._LOG_LIMIT)
+        self.assertTrue(log.endswith(b"private-final-line"))
+        self.assertTrue(child.killed)
 
     async def test_notification_failure_does_not_fail_install_or_leak(self):
         callback = AsyncMock(side_effect=RuntimeError("secret-password"))

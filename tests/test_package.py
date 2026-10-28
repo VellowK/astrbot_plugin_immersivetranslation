@@ -47,7 +47,9 @@ class PackageTests(unittest.TestCase):
                 self.assertEqual(schema["engine_python"]["default"], "")
                 self.assertIs(schema["auto_install_engine"]["default"], True)
                 self.assertEqual(schema["engine_setup_timeout"]["default"], 1800)
-                self.assertIn(b"version: v0.2.0", archive.read(prefix + "metadata.yaml"))
+                self.assertIs(schema["auto_translate_attachment"]["default"], False)
+                self.assertIn(prefix + "intent.py", names)
+                self.assertIn(b"version: v0.2.1", archive.read(prefix + "metadata.yaml"))
             with self.assertRaises(FileExistsError):
                 package.build(ROOT, destination)
 

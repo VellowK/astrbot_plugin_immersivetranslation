@@ -13,6 +13,7 @@ import hashlib
 import json
 import os
 import platform
+import re
 import sys
 import tempfile
 import weakref
@@ -28,6 +29,47 @@ _OUTPUT_LIMIT = 16384
 _LOCK_POLL = 0.1
 _LOCKS: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
 _OWNER = "astrbot_plugin_immersivetranslation/runtime-v1"
+_ERROR_TOKENS = {
+    "venv": (b"ensurepip", b"no module named venv", b"no module named pip"),
+    "distribution": (b"no matching distribution", b"could not find a version"),
+    "build": (
+        b"failed building wheel",
+        b"failed to build",
+        b"could not build wheels",
+        b"metadata-generation-failed",
+    ),
+    # Bare words like 'network', 'proxy' or 'connection' also occur in successful
+    # package downloads and URLs. Only recognize actual transport error phrases.
+    "network": (
+        b"proxyerror",
+        b"cannot connect to proxy",
+        b"proxy connection failed",
+        b"connection refused",
+        b"connection reset",
+        b"connection aborted",
+        b"connection broken",
+        b"failed to establish a new connection",
+        b"newconnectionerror",
+        b"connecttimeout",
+        b"readtimeout",
+        b"timed out",
+        b"certificate_verify_failed",
+        b"certificate verify failed",
+        b"sslerror",
+        b"name resolution",
+        b"name or service not known",
+        b"getaddrinfo failed",
+        b"network is unreachable",
+        b"could not fetch url",
+    ),
+}
+_SCAN_OVERLAP = max(len(token) for tokens in _ERROR_TOKENS.values() for token in tokens) - 1
+_PACKAGE_ERROR = re.compile(
+    r"(?:ERROR: )?(?:No matching distribution found for "
+    r"|Could not find a version that satisfies the requirement "
+    r"|Failed building wheel for |Failed to build )"
+    r"([a-zA-Z0-9][a-zA-Z0-9._-]{0,99})(?=$|[\s<>=!~\[])"
+)
 
 
 def _setup_timeout(config: dict) -> int:
@@ -392,8 +434,23 @@ class EngineRuntime:
                 "引擎依赖自检失败；请管理员检查本地安装日志及 Python/系统架构兼容性，再重新翻译。"
             ) from None
 
+    def _known_packages(self) -> dict[str, str]:
+        """Only disclose names pinned in bundled manifests, never arbitrary log text."""
+        packages = {}
+        for path in self._requirements({"ocr_mode": "auto"}):
+            try:
+                if path.stat().st_size > 16384:
+                    continue
+                for name in re.findall(
+                    r"(?im)^\s*([a-z0-9][a-z0-9._-]{0,99})==", path.read_text("utf-8")
+                ):
+                    packages[re.sub(r"[-_.]+", "-", name).lower()] = name
+            except (OSError, UnicodeError):
+                pass
+        return packages
+
     async def _run(self, args: list[str], phase: str, capture: bool = False) -> bytes:
-        """Drain both streams continuously; cap retained output and private disk log."""
+        """Drain both streams; finalize a bounded, private tail log even on cancellation."""
         log_path = self.directory / "setup.log"
         if log_path.is_symlink():
             raise TranslationError("引擎安装日志路径无效，请管理员检查插件数据目录。")
@@ -401,38 +458,59 @@ class EngineRuntime:
             log_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0), 0o600
         )
         output = bytearray()
+        tails = [bytearray(), bytearray()]
         signatures: set[str] = set()
+        packages: set[str] = set()
+        known_packages = self._known_packages()
         written = 0
         child = None
         with os.fdopen(fd, "wb") as log:
             os.chmod(log_path, 0o600)
 
-            async def drain(stream, collect=False):
+            def package_error(line: bytes) -> None:
+                match = _PACKAGE_ERROR.match(line.decode("ascii", errors="replace").strip())
+                if match:
+                    normalized = re.sub(r"[-_.]+", "-", match[1]).lower()
+                    if normalized in known_packages:
+                        packages.add(known_packages[normalized])
+
+            async def drain(stream, tail, collect=False):
                 nonlocal written
+                overlap = b""
+                line = bytearray()
+                oversized_line = False
                 while chunk := await stream.read(8192):
-                    lower = chunk.lower()
-                    for token in (
-                        b"ensurepip",
-                        b"no module named venv",
-                        b"no module named pip",
-                        b"no matching distribution",
-                        b"could not find a version",
-                        b"failed building wheel",
-                        b"connection",
-                        b"proxy",
-                        b"timed out",
-                        b"certificate",
-                        b"network",
-                        b"name resolution",
-                    ):
-                        if token in lower:
-                            signatures.add(token.decode())
+                    lower = overlap + chunk.lower()
+                    for category, tokens in _ERROR_TOKENS.items():
+                        if any(token in lower for token in tokens):
+                            signatures.add(category)
+                    overlap = lower[-_SCAN_OVERLAP:]
+                    # Parse only complete, bounded lines; never treat a truncated
+                    # URL/credential fragment as a package name.
+                    for index, fragment in enumerate(chunk.split(b"\n")):
+                        if index:
+                            if not oversized_line:
+                                package_error(bytes(line))
+                            line.clear()
+                            oversized_line = False
+                        if len(line) + len(fragment) > 4096:
+                            oversized_line = True
+                            line.clear()
+                        elif not oversized_line:
+                            line.extend(fragment)
+                    tail.extend(chunk)
+                    if len(tail) > _LOG_LIMIT:
+                        del tail[:-_LOG_LIMIT]
+                    # Keep early progress visible without repeatedly rewriting a
+                    # full log. The retained tail replaces it in the finalizer.
                     if written < _LOG_LIMIT:
                         block = chunk[: _LOG_LIMIT - written]
                         log.write(block)
                         written += len(block)
                     if collect:
                         output.extend(chunk[: max(0, _OUTPUT_LIMIT + 1 - len(output))])
+                if not oversized_line:
+                    package_error(bytes(line))
 
             readers = []
             try:
@@ -456,49 +534,92 @@ class EngineRuntime:
                         pass
                     raise
                 readers = [
-                    asyncio.create_task(drain(child.stdout, capture)),
-                    asyncio.create_task(drain(child.stderr)),
+                    asyncio.create_task(drain(child.stdout, tails[0], capture)),
+                    asyncio.create_task(drain(child.stderr, tails[1])),
                     asyncio.create_task(child.wait()),
                 ]
                 await asyncio.gather(*readers)
                 if child.returncode != 0 or len(output) > _OUTPUT_LIMIT:
-                    raise TranslationError(self._failure(phase, signatures))
+                    raise TranslationError(self._failure(phase, signatures, packages))
                 return bytes(output)
             except OSError:
-                raise TranslationError(self._failure(phase, signatures)) from None
+                raise TranslationError(self._failure(phase, signatures, packages)) from None
             finally:
                 try:
-                    if child is not None:
-                        await process.kill_tree(child)
+                    try:
+                        if child is not None:
+                            await process.kill_tree(child)
+                    finally:
+                        for task in readers:
+                            if not task.done():
+                                task.cancel()
+                        if readers:
+                            await asyncio.gather(*readers, return_exceptions=True)
                 finally:
-                    for task in readers:
-                        if not task.done():
-                            task.cancel()
-                    if readers:
-                        await asyncio.gather(*readers, return_exceptions=True)
+                    # Keep each stream's end: a late verbose stdout reader must
+                    # not evict stderr's actual pip error (or vice versa). Group
+                    # stdout then stderr; spare capacity goes to the other stream.
+                    stderr_size = min(len(tails[1]), _LOG_LIMIT // 2)
+                    stdout_size = min(len(tails[0]), _LOG_LIMIT - stderr_size)
+                    stderr_size = min(len(tails[1]), _LOG_LIMIT - stdout_size)
+                    log.seek(0)
+                    if stdout_size:
+                        log.write(tails[0][-stdout_size:])
+                    if stderr_size:
+                        log.write(tails[1][-stderr_size:])
+                    log.truncate()
 
     @staticmethod
-    def _failure(phase: str, signatures: set[str]) -> str:
-        if phase == "venv" or signatures.intersection(
-            {"ensurepip", "no module named venv", "no module named pip"}
-        ):
-            return (
+    def _failure(phase: str, signatures: set[str], packages: set[str]) -> str:
+        # Values are local interpreter metadata, not environment variables or
+        # subprocess output. Unknown OS/architecture strings are not echoed.
+        system = {"win32": "Windows", "linux": "Linux", "darwin": "macOS"}.get(
+            sys.platform, "其他系统"
+        )
+        machine = platform.machine().lower()
+        architecture = {
+            "amd64": "x86_64",
+            "x86_64": "x86_64",
+            "x86": "x86",
+            "i386": "x86",
+            "i686": "x86",
+            "aarch64": "ARM64",
+            "arm64": "ARM64",
+            "armv7l": "ARMv7",
+            "ppc64le": "ppc64le",
+            "s390x": "s390x",
+            "riscv64": "riscv64",
+        }.get(machine, "未知架构")
+        version = ".".join(str(part) for part in sys.version_info[:3])
+        context = (
+            f"当前自动环境：Python {version}，{system}/{architecture}，"
+            f"Python {64 if sys.maxsize > 2**32 else 32} 位。"
+            "本地私有日志：插件数据目录 runtime/setup.log（仅保留末尾，可能含凭据，"
+            "请先脱敏再提供给管理员，不要直接发送到群聊）。"
+        )
+        if phase == "venv" or "venv" in signatures:
+            message = (
                 "无法创建带 pip 的独立环境；请管理员为宿主 Python 安装 venv/ensurepip 支持，"
                 "或配置已安装引擎的 engine_python；插件不会升级宿主包。"
             )
-        if signatures.intersection(
-            {"no matching distribution", "could not find a version", "failed building wheel"}
-        ):
-            return (
-                "依赖没有适用的安装包或构建失败；请检查 Python 版本、系统架构及镜像源的 wheel 支持，"
-                "也可配置兼容的 engine_python。"
+        # pip often reports 'no matching distribution' after failing to reach its
+        # index. Transport evidence must take precedence over compatibility guesses.
+        elif "network" in signatures:
+            message = (
+                "引擎依赖下载失败；请管理员先检查网络、代理、证书和 pip 镜像设置，"
+                "网络错误后的“无匹配版本”不能据此判断为依赖不兼容，再重新发起翻译。"
             )
-        if signatures.intersection(
-            {"connection", "proxy", "timed out", "certificate", "network", "name resolution"}
-        ):
-            return (
-                "引擎依赖下载失败；请管理员检查网络、代理、证书和 pip 镜像设置，然后重新发起翻译。"
+        elif signatures.intersection({"distribution", "build"}):
+            message = (
+                "依赖没有适用的安装包或构建失败；请管理员核对日志中的失败包及其 Python 版本、"
+                "系统架构和镜像源 wheel 支持；构建失败还需检查编译工具及系统库。"
+                "可配置兼容的 engine_python；不要仅凭此提示更改依赖版本。"
             )
-        return (
-            "引擎依赖安装或自检失败；请管理员检查本地安装日志、网络和系统兼容性，然后重新发起翻译。"
-        )
+            if packages:
+                message += "已识别的失败依赖：" + "、".join(sorted(packages)[:3]) + "。"
+        else:
+            message = (
+                "引擎依赖安装或自检失败；请管理员检查本地安装日志、网络和系统兼容性，"
+                "然后重新发起翻译。"
+            )
+        return message + context

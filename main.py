@@ -19,6 +19,7 @@ from astrbot.core.utils.astrbot_path import get_astrbot_data_path
 from .bridge import ModelBridge
 from .download import download, safe_name
 from .errors import TranslationError
+from .intent import requested_language
 from .process import run_engine
 from .runtime import EngineRuntime
 
@@ -29,7 +30,7 @@ except ImportError:  # Python 3.10; installed by aiohttp on this Python version.
 
 FORMATS = {".pdf", ".png", ".jpg", ".jpeg", ".webp"}
 HELP = """沉浸式文档翻译 · BabelDOC 开源引擎
-私聊直接发送一个 PDF 即可翻译；或先发 /沉浸翻译，再发送附件。
+只发 PDF / 图片不会翻译。请说「翻译」「帮我翻译一下这个文件」或发送 /沉浸翻译；也可先请求、再发附件。
 /沉浸翻译 帮助 · /沉浸翻译 状态 · /沉浸翻译 取消
 支持模型工具 immersive_translate，使用当前或同一用户最近发送的附件，不接受任意路径。
 默认英→中，返回译文及双语 PDF。图片和扫描件需开启可选 OCR，仅适合清晰黑字白底，图片输出为 PDF。
@@ -314,9 +315,26 @@ class ImmersiveTranslationPlugin(Star):
             if error:
                 logger.error("沉浸翻译后台任务异常：%s", type(error).__name__)
 
+    def _text(self, event):
+        # Read only actual message text, never filenames or attachment/document contents.
+        return "".join(
+            part.text for part in event.get_messages() if isinstance(part, Plain)
+        ).strip()
+
+    def _request(self, event):
+        text = self._text(event)
+        language = requested_language(text)
+        if language is not None:
+            return language
+        # A prior explicit request authorizes only the same user's next bare attachment,
+        # not unrelated subsequent instructions, nor an attachment-free model tool call.
+        if not text and self._key(event) in self.pending and self._attachments(event):
+            return self.pending_languages.get(self._key(event), "")
+        return None
+
     @filter.llm_tool(name="immersive_translate")
     async def immersive_translate(self, event: AstrMessageEvent, target_language: str = "") -> str:
-        """Translate the user's current or recent attached PDF/image while preserving layout using BabelDOC. Starts a background task and sends PDF results back to this chat. Requires a user translation request; source text goes to the configured model and may incur costs. No arbitrary paths or URLs.
+        """Translate an attached/recent PDF or image only after the user explicitly requests document translation. A bare attachment, summary request or model inference is not consent and will be rejected. Use /沉浸翻译 or clear requests such as 帮我翻译一下这个文件. Starts a background task returning PDFs; document text goes to the configured model and may incur costs. No arbitrary paths or URLs.
 
         Args:
             target_language(string): Target language code, for example zh, en or ja. Empty uses plugin configuration.
@@ -324,14 +342,19 @@ class ImmersiveTranslationPlugin(Star):
         self._prune()
         if not self._allowed(event):
             return "当前用户或群聊不允许使用此工具。"
-        return await self._launch(event, target_language)
+        text = self._text(event)
+        if text and requested_language(text) is None:
+            self.pending.pop(self._key(event), None)
+            self.pending_languages.pop(self._key(event), None)
+        language = self._request(event)
+        if language is None:
+            return "尚未获得明确的文档翻译请求，不会启动引擎。请用户说「翻译这个文件」或发送 /沉浸翻译；只发附件不表示同意翻译。"
+        return await self._launch(event, language or target_language)
 
     @filter.event_message_type(filter.EventMessageType.ALL, priority=10)
     async def on_message(self, event: AstrMessageEvent):
         self._prune()
-        text = "".join(
-            part.text for part in event.get_messages() if isinstance(part, Plain)
-        ).strip()
+        text = self._text(event)
         command = re.fullmatch(r"/?沉浸翻译(?:\s+(.*))?", text)
         if not self._allowed(event, explicit=command is not None):
             return
@@ -367,17 +390,21 @@ class ImmersiveTranslationPlugin(Star):
             else:
                 await event.send(event.plain_result(HELP))
             return
+        if text and requested_language(text) is None:
+            self.pending.pop(key, None)
+            self.pending_languages.pop(key, None)
         attachments = self._attachments(event)
-        if not attachments:
-            return
+        # This is an in-memory, same-user reference only: no download, installation,
+        # model call, notification or event interception for an unsolicited attachment.
         if len(attachments) == 1 and (key in self.recent or len(self.recent) < 256):
             self.recent[key] = (
                 time.monotonic() + integer(self.config, "recent_timeout", 120, 15, 600),
                 attachments[0],
             )
-        if key in self.pending or self.config.get("auto_translate_attachment", True):
+        language = self._request(event)
+        if language is not None:
             event.stop_event()
-            await event.send(event.plain_result(await self._launch(event)))
+            await event.send(event.plain_result(await self._launch(event, language)))
 
     async def terminate(self):
         self.closing = True

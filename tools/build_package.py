@@ -15,6 +15,7 @@ NAME = "astrbot_plugin_immersivetranslation"
 SOURCES = (
     "__init__.py",
     "main.py",
+    "intent.py",
     "bridge.py",
     "download.py",
     "process.py",

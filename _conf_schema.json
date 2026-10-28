@@ -10,7 +10,7 @@
   "allowed_users": {"description": "允许的用户 ID 白名单", "type": "list", "default": [], "hint": "空列表不限制用户；公共 bot 建议配置白名单，控制模型费用。"},
   "enable_group": {"description": "允许群聊翻译", "type": "bool", "default": false, "hint": "群聊结果会返回原群，注意文档隐私。"},
   "group_require_at": {"description": "群聊自然语言及附件触发需 @ 或唤醒", "type": "bool", "default": true, "hint": "显式 /沉浸翻译 命令及同一用户限时后续附件可免再次 @。"},
-  "auto_translate_attachment": {"description": "允许的会话中收到附件自动翻译", "type": "bool", "default": true, "hint": "默认私聊发送 PDF/图片即触发，原文会发送给模型并可能计费。关闭后使用命令或模型工具。"},
+  "auto_translate_attachment": {"description": "旧版附件自动翻译（已停用）", "type": "bool", "default": false, "hint": "兼容旧配置保留，设置为 true 也不再自动翻译。仅明确说「翻译」/发送命令或同用户限时后续附件才启动；单独发 PDF/图片只记录近期附件。"},
   "max_file_mb": {"description": "单文件上限（MiB）", "type": "int", "default": 20, "slider": {"min": 1, "max": 100, "step": 1}},
   "max_pages": {"description": "输入 PDF 页数上限", "type": "int", "default": 20, "slider": {"min": 1, "max": 20, "step": 1}},
   "max_pixels_million": {"description": "单页/图片像素上限（百万像素）", "type": "int", "default": 20, "slider": {"min": 1, "max": 20, "step": 1}},
