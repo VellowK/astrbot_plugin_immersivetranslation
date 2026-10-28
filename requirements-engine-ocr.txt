@@ -1,0 +1,4 @@
+# Optional OCR engine environment: Python 3.10-3.12 only; 3.12 recommended.
+# Includes the base engine dependencies; never install in the AstrBot host env.
+-r requirements-engine.txt
+rapidocr-onnxruntime==1.4.4

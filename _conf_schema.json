@@ -1,0 +1,21 @@
+{
+  "engine_python": {"description": "独立引擎 Python 绝对路径", "type": "string", "default": "", "hint": "需在独立环境安装 requirements-engine.txt。空值未配置，不会自动安装引擎。"},
+  "provider_id": {"description": "AstrBot 文本模型供应商 ID", "type": "string", "default": "", "hint": "留空使用当前会话模型；复用 AstrBot 模型密钥，不使用商业沉浸式翻译会员接口。"},
+  "source_language": {"description": "源语言代码", "type": "string", "default": "en", "hint": "例如 en、zh、ja。默认英译中；其他语言效果需自行验证。"},
+  "target_language": {"description": "目标语言代码", "type": "string", "default": "zh", "hint": "例如 zh、en、ja、zh-CN。"},
+  "output_mode": {"description": "输出 PDF 类型", "type": "string", "default": "both", "options": ["both", "mono", "dual"], "hint": "both：译文和双语；mono：译文；dual：双语。"},
+  "ocr_mode": {"description": "本地 OCR", "type": "string", "default": "off", "options": ["off", "auto"], "hint": "图片/扫描件需启用 auto 且独立环境安装 requirements-engine-ocr.txt（Python3.10–3.12）。仅适合清晰英文/中文黑字白底，结果为 PDF，可能遮盖底图。"},
+  "allowed_users": {"description": "允许的用户 ID 白名单", "type": "list", "default": [], "hint": "空列表不限制用户；公共 bot 建议配置白名单，控制模型费用。"},
+  "enable_group": {"description": "允许群聊翻译", "type": "bool", "default": false, "hint": "群聊结果会返回原群，注意文档隐私。"},
+  "group_require_at": {"description": "群聊自然语言及附件触发需 @ 或唤醒", "type": "bool", "default": true, "hint": "显式 /沉浸翻译 命令及同一用户限时后续附件可免再次 @。"},
+  "auto_translate_attachment": {"description": "允许的会话中收到附件自动翻译", "type": "bool", "default": true, "hint": "默认私聊发送 PDF/图片即触发，原文会发送给模型并可能计费。关闭后使用命令或模型工具。"},
+  "max_file_mb": {"description": "单文件上限（MiB）", "type": "int", "default": 20, "slider": {"min": 1, "max": 100, "step": 1}},
+  "max_pages": {"description": "输入 PDF 页数上限", "type": "int", "default": 20, "slider": {"min": 1, "max": 20, "step": 1}},
+  "max_pixels_million": {"description": "单页/图片像素上限（百万像素）", "type": "int", "default": 20, "slider": {"min": 1, "max": 20, "step": 1}},
+  "max_model_calls": {"description": "单作业模型桥请求次数上限", "type": "int", "default": 200, "hint": "包含失败/被拒绝请求；不能折算固定金额，不保证免费。", "slider": {"min": 1, "max": 2000, "step": 1}},
+  "model_timeout": {"description": "单次模型超时（秒）", "type": "int", "default": 120, "slider": {"min": 10, "max": 600, "step": 10}},
+  "job_timeout": {"description": "整个作业总时限（秒）", "type": "int", "default": 1800, "slider": {"min": 60, "max": 7200, "step": 60}},
+  "cache_minutes": {"description": "插件作业文件保留（分钟）", "type": "int", "default": 60, "hint": "仅清理插件作业目录。引擎可能另存原文/翻译缓存，管理员需单独管理。", "slider": {"min": 5, "max": 1440, "step": 5}},
+  "recent_timeout": {"description": "同一用户近期附件有效期（秒）", "type": "int", "default": 120, "slider": {"min": 15, "max": 600, "step": 15}},
+  "allow_private_downloads": {"description": "允许下载内网附件（高风险）", "type": "bool", "default": false, "hint": "仅可信自建平台适配器确需内网 URL 时启用，建议配合用户白名单。默认阻止内网/回环/DNS 重绑定并拒绝跳转。"}
+}

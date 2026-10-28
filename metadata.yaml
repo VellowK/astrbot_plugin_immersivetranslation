@@ -1,0 +1,7 @@
+name: astrbot_plugin_immersivetranslation
+display_name: 沉浸式文档翻译
+desc: 使用 PDFMathTranslate-next/BabelDOC 和 AstrBot 已配置模型翻译 PDF 与图片，尽力保留原始排版。
+version: v0.1.0
+author: VellowK
+repo: https://github.com/VellowK/astrbot_plugin_immersivetranslation
+astrbot_version: ">=4.16,<5"

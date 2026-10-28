@@ -1,0 +1,8 @@
+# Separate engine environment: Python 3.10-3.13; Python 3.12 recommended.
+# Never install this requirements file in the AstrBot host environment.
+pdf2zh-next==2.9.0
+Pillow>=10,<12
+# BabelDOC 0.6.x imports BitStream, removed in bitstring 5.
+bitstring>=4.3,<5
+# Keep the upstream PyMuPDF constraint explicit for reproducibility/compatibility.
+PyMuPDF<1.25.3

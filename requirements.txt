@@ -1,0 +1,2 @@
+# AstrBot host environment only. Install engine dependencies in a separate venv.
+aiohttp>=3.9,<4

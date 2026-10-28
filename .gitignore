@@ -1,0 +1,37 @@
+# Python and isolated engine environments
+.venv/
+.engine/
+.engine-*/
+engine/.venv/
+engine/venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.ruff_cache/
+.pytest_cache/
+
+# Local publishing/tooling and generated integration artifacts
+.publish*/
+.tools/
+tests/artifacts/
+
+# Local credentials and ephemeral bridge tokens: never commit secrets
+.env
+.env.*
+!.env.example
+credentials.json
+credentials.*.json
+*credentials*.json
+*.token
+token.txt
+tokens.json
+bridge-token*
+engine/credentials*
+engine/token*
+
+# Editor/OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
