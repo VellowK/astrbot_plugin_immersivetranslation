@@ -29,7 +29,8 @@ try:
 except ImportError:  # Python 3.10; installed by aiohttp on this Python version.
     from async_timeout import timeout
 
-PLUGIN_VERSION = "v0.2.3"
+PLUGIN_VERSION = "v0.2.4"
+WAITING_MESSAGE = "请在120秒内发送一个 PDF 或图片附件。原文将发送到配置的模型，可能产生费用。"
 FORMATS = {".pdf", ".png", ".jpg", ".jpeg", ".webp"}
 HELP = f"""沉浸式文档翻译 {PLUGIN_VERSION} · BabelDOC 开源引擎
 只发 PDF / 图片不会翻译。请说「翻译」「帮我翻译一下这个文件」或发送 /沉浸翻译；也可先请求、再发附件。
@@ -407,7 +408,7 @@ class ImmersiveTranslationPlugin(Star):
                 return "等待请求过多，请稍后重试。"
             self.pending[key] = time.monotonic() + 120
             self.pending_languages[key] = language
-            return "请在120秒内发送一个 PDF 或图片附件。原文将发送到配置的模型，可能产生费用。"
+            return WAITING_MESSAGE
         directory = self.root / ("job_" + uuid.uuid4().hex)
         directory.mkdir(mode=0o700)
         self.pending.pop(key, None)
@@ -423,6 +424,106 @@ class ImmersiveTranslationPlugin(Star):
             "当前明确请求" if self._text(event) else "先前明确请求的后续附件",
         )
         return f"沉浸翻译 {PLUGIN_VERSION}：翻译任务已启动；首次使用将自动联网准备引擎。完成后自动发送译本；/沉浸翻译 状态 可查看，/沉浸翻译 取消 可中止。原文会发送至配置的模型并可能计费。"
+
+    async def _persona_prompt(self, event):
+        """Resolve the active session persona; older AstrBot uses the v3 default API."""
+        manager = self.context.persona_manager
+        conversation_manager = self.context.conversation_manager
+        umo = event.unified_msg_origin
+        cid = await conversation_manager.get_curr_conversation_id(umo)
+        conversation = await conversation_manager.get_conversation(umo, cid) if cid else None
+        persona_id = getattr(conversation, "persona_id", None)
+        resolve = getattr(manager, "resolve_selected_persona", None)
+        if callable(resolve):
+            cfg = self.context.get_config(umo)
+            selected, persona, _, webchat_default = await resolve(
+                umo=umo,
+                conversation_persona_id=persona_id,
+                platform_name=event.get_platform_name(),
+                provider_settings=cfg.get("provider_settings", {}),
+            )
+            if webchat_default or (persona is None and selected != "[%None]"):
+                raise ValueError("selected persona unavailable for isolated generation")
+            return persona.get("prompt", "") if persona else ""
+        if persona_id and persona_id != "[%None]":
+            persona = await manager.get_persona(persona_id)
+            return getattr(persona, "system_prompt", "")
+        if persona_id == "[%None]":
+            return ""
+        persona = await manager.get_default_persona_v3(umo)
+        return persona.get("prompt", "") if persona else ""
+
+    async def _waiting_reply(self, event, result):
+        """Only the pending-attachment response gets a tool-free persona rewrite."""
+        if result != WAITING_MESSAGE:
+            return result
+        key = self._key(event)
+        original_expiry = self.pending.get(key)
+        if original_expiry is None:
+            return None
+        if not self.config.get("persona_waiting_reply", True):
+            return result
+        try:
+            async with timeout(8):
+                provider = await self.context.get_current_chat_provider_id(event.unified_msg_origin)
+                persona = await self._persona_prompt(event)
+                response = await self.context.llm_generate(
+                    chat_provider_id=provider,
+                    system_prompt=persona,
+                    prompt=(
+                        "请按你的人格口吻简短邀请对方发送待翻译的 PDF 或图片。"
+                        "只输出一句自然回复；不要提时限、隐私、费用、翻译是否已启动，"
+                        "不要执行任何工具。"
+                    ),
+                    tools=None,
+                )
+                text = getattr(response, "completion_text", "")
+                if not isinstance(text, str) or not text.strip() or len(text) > 300:
+                    raise ValueError("invalid response")
+                text = text.strip()
+                # Reject obviously contradictory or sensitive additions; model text is
+                # still untrusted and this is not a complete semantic safety filter.
+                if re.search(
+                    r"\d|https?://|www\.|@|密码|密钥|口令|令牌|验证|证件|银行卡|"
+                    r"隐私|保密|安全|泄露|保存|上传|下载|网络|模型|供应商|费用|免费|"
+                    r"收费|付费|计费|花钱|秒|分钟|小时|已开始|已启动|正在翻译|完成",
+                    text,
+                    re.I,
+                ):
+                    raise ValueError("unsafe or contradictory generated response")
+                # Reject verbatim substantial fragments of the persona prompt.
+                if isinstance(persona, str) and any(
+                    text[i : i + 12] in persona for i in range(max(0, len(text) - 11))
+                ):
+                    raise ValueError("generated response repeats persona prompt")
+                # Preserve unambiguous time and privacy/cost facts outside model output.
+                result = text + "\n有效期：120秒；原文将发送至配置的模型，可能计费。"
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.debug("等待附件提示人格化不可用：%s", type(exc).__name__)
+        # Concurrent cancel/new request/attachment must not receive a stale prompt.
+        if self.pending.get(key) != original_expiry:
+            return None
+        self.pending[key] = time.monotonic() + 120
+        return result
+
+    async def _send_launch_result(self, event, result):
+        waiting = result == WAITING_MESSAGE
+        rendered = await self._waiting_reply(event, result)
+        if rendered is None:
+            return
+        key = self._key(event)
+        expiry = self.pending.get(key) if waiting else None
+        try:
+            await event.send(event.plain_result(rendered))
+        except BaseException:
+            if waiting and expiry is not None and self.pending.get(key) == expiry:
+                self.pending.pop(key, None)
+                self.pending_languages.pop(key, None)
+            raise
+        if waiting and expiry is not None and self.pending.get(key) == expiry:
+            self.pending[key] = time.monotonic() + 120
 
     def _task_done(self, key, directory, task):
         if self.jobs.get(key) is task:
@@ -529,7 +630,7 @@ class ImmersiveTranslationPlugin(Star):
                     )
                 )
             elif argument in {"", "翻译", "开始"}:
-                await event.send(event.plain_result(await self._launch(event)))
+                await self._send_launch_result(event, await self._launch(event))
             else:
                 await event.send(event.plain_result(HELP))
             return
@@ -547,7 +648,7 @@ class ImmersiveTranslationPlugin(Star):
         language = self._request(event)
         if language is not None:
             event.stop_event()
-            await event.send(event.plain_result(await self._launch(event, language)))
+            await self._send_launch_result(event, await self._launch(event, language))
 
     async def terminate(self):
         self.closing = True

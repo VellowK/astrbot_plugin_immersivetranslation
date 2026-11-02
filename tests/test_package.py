@@ -49,8 +49,8 @@ class PackageTests(unittest.TestCase):
                 self.assertEqual(schema["engine_setup_timeout"]["default"], 1800)
                 self.assertIs(schema["auto_translate_attachment"]["default"], False)
                 self.assertIn(prefix + "intent.py", names)
-                self.assertIn(b"version: v0.2.3", archive.read(prefix + "metadata.yaml"))
-                self.assertIn(b'PLUGIN_VERSION = "v0.2.3"', archive.read(prefix + "main.py"))
+                self.assertIn(b"version: v0.2.4", archive.read(prefix + "metadata.yaml"))
+                self.assertIn(b'PLUGIN_VERSION = "v0.2.4"', archive.read(prefix + "main.py"))
             with self.assertRaises(FileExistsError):
                 package.build(ROOT, destination)
 

@@ -3,6 +3,7 @@
   "auto_install_engine": {"description": "自动准备隔离翻译引擎", "type": "bool", "default": true, "hint": "首次翻译联网创建独立环境并下载依赖，可能耗时较长；engine_python 非空时无效。关闭后必须配置手动引擎。插件 ZIP 不是离线依赖包。"},
   "engine_setup_timeout": {"description": "引擎准备时限（秒）", "type": "int", "default": 1800, "hint": "独立于翻译时限；失败后修复网络或环境，再次提交翻译可重试；取消任务可中止安装。", "slider": {"min": 60, "max": 7200, "step": 60}},
   "provider_id": {"description": "AstrBot 文本模型供应商 ID", "type": "string", "default": "", "hint": "留空使用当前会话模型；复用 AstrBot 模型密钥，不使用商业沉浸式翻译会员接口。"},
+  "persona_waiting_reply": {"description": "等待附件提示按当前人格生成", "type": "bool", "default": true, "hint": "仅为等待附件提示向当前聊天模型发送该会话人格提示词，额外调用一次可能计费；不发送文件、不调用工具。失败退回固定提示，不经过完整普通对话插件链。"},
   "source_language": {"description": "源语言代码", "type": "string", "default": "en", "hint": "例如 en、zh、ja。默认英译中；其他语言效果需自行验证。"},
   "target_language": {"description": "目标语言代码", "type": "string", "default": "zh", "hint": "例如 zh、en、ja、zh-CN。"},
   "output_mode": {"description": "输出 PDF 类型", "type": "string", "default": "both", "options": ["both", "mono", "dual"], "hint": "both：译文和双语；mono：译文；dual：双语。"},

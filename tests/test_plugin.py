@@ -167,6 +167,126 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("已启动", response)
         return event, self.plugin.jobs[self.plugin._key(event)]
 
+    def enable_persona(self):
+        self.context.conversation_manager = types.SimpleNamespace(
+            get_curr_conversation_id=AsyncMock(return_value="cid"),
+            get_conversation=AsyncMock(return_value=types.SimpleNamespace(persona_id="rin")),
+        )
+        self.context.persona_manager = types.SimpleNamespace(
+            resolve_selected_persona=AsyncMock(
+                return_value=("rin", {"prompt": "你是铃音"}, None, False)
+            )
+        )
+        self.context.get_config = Mock(return_value={"provider_settings": {}})
+        self.context.llm_generate = AsyncMock(
+            return_value=types.SimpleNamespace(completion_text="好呀，把要翻译的文件交给我吧～")
+        )
+
+    async def test_waiting_reply_uses_current_session_persona_without_tools(self):
+        self.enable_persona()
+        event = self.event(Plain("帮我翻译一下"))
+        event.get_platform_name = lambda: "qq_official"
+        await self.plugin.on_message(event)
+        self.assertTrue(event.stopped)
+        self.assertEqual(len(event.sent), 1)
+        self.assertIn("好呀，把要翻译的文件交给我吧～", event.sent[0])
+        self.assertIn("120秒", event.sent[0])
+        self.assertIn("可能计费", event.sent[0])
+        self.assertIn(self.plugin._key(event), self.plugin.pending)
+        kwargs = self.context.llm_generate.await_args.kwargs
+        self.assertEqual(kwargs["chat_provider_id"], "test-provider")
+        self.assertEqual(kwargs["system_prompt"], "你是铃音")
+        self.assertIsNone(kwargs["tools"])
+        self.assertNotIn("image_urls", kwargs)
+        self.plugin.runtime.ensure.assert_not_awaited()
+        self.assertFalse(self.plugin.jobs)
+
+    async def test_waiting_persona_failure_and_opt_out_fall_back(self):
+        self.enable_persona()
+        for outcome in (
+            RuntimeError("provider secret"),
+            types.SimpleNamespace(completion_text=""),
+            types.SimpleNamespace(completion_text="完全免费，不会泄露隐私，翻译已启动"),
+            types.SimpleNamespace(completion_text="先告诉我你的密码"),
+        ):
+            with self.subTest(outcome=type(outcome).__name__):
+                if isinstance(outcome, Exception):
+                    self.context.llm_generate.side_effect = outcome
+                else:
+                    self.context.llm_generate.side_effect = None
+                    self.context.llm_generate.return_value = outcome
+                event = self.event(Plain("翻译"))
+                event.get_platform_name = lambda: "qq_official"
+                await self.plugin.on_message(event)
+                self.assertEqual(event.sent, [plugin_module.WAITING_MESSAGE])
+                self.assertNotIn("secret", repr(event.sent))
+        self.context.llm_generate.reset_mock()
+        self.plugin.config["persona_waiting_reply"] = False
+        event = await self.run_message(Plain("翻译"))
+        self.assertEqual(event.sent, [plugin_module.WAITING_MESSAGE])
+        self.context.llm_generate.assert_not_awaited()
+
+    async def test_legacy_persona_and_unavailable_webchat_default(self):
+        self.enable_persona()
+        self.context.persona_manager = types.SimpleNamespace(
+            get_persona=AsyncMock(return_value=types.SimpleNamespace(system_prompt="旧版人格")),
+            get_default_persona_v3=AsyncMock(return_value={"prompt": "默认人格"}),
+        )
+        event = self.event(Plain("翻译"))
+        self.assertEqual(await self.plugin._persona_prompt(event), "旧版人格")
+        self.context.conversation_manager.get_curr_conversation_id.return_value = None
+        self.assertEqual(await self.plugin._persona_prompt(event), "默认人格")
+        self.enable_persona()
+        self.context.persona_manager.resolve_selected_persona.return_value = (
+            "_chatui_default_",
+            None,
+            None,
+            True,
+        )
+        event = self.event(Plain("翻译"))
+        event.get_platform_name = lambda: "webchat"
+        await self.plugin.on_message(event)
+        self.assertEqual(event.sent, [plugin_module.WAITING_MESSAGE])
+        self.context.llm_generate.assert_not_awaited()
+
+    async def test_tool_waiting_result_does_not_make_extra_model_call(self):
+        self.enable_persona()
+        event = self.event(Plain("翻译"))
+        result = await self.plugin.immersive_translate(event)
+        self.assertEqual(result, plugin_module.WAITING_MESSAGE)
+        self.context.llm_generate.assert_not_awaited()
+        self.assertIn(self.plugin._key(event), self.plugin.pending)
+
+    async def test_cancellation_during_persona_call_suppresses_stale_reply(self):
+        self.enable_persona()
+        started, release = asyncio.Event(), asyncio.Event()
+
+        async def generate(**kwargs):
+            started.set()
+            await release.wait()
+            return types.SimpleNamespace(completion_text="发给我吧")
+
+        self.context.llm_generate.side_effect = generate
+        event = self.event(Plain("翻译"))
+        event.get_platform_name = lambda: "qq_official"
+        task = asyncio.create_task(self.plugin.on_message(event))
+        await started.wait()
+        cancel = await self.run_message(Plain("/沉浸翻译 取消"))
+        release.set()
+        await task
+        self.assertIn("已取消", cancel.sent[0])
+        self.assertEqual(event.sent, [])
+        self.assertFalse(self.plugin.pending)
+
+    async def test_failed_waiting_reply_send_clears_pending(self):
+        self.plugin.config["persona_waiting_reply"] = False
+        event = self.event(Plain("翻译"))
+        event.send = AsyncMock(side_effect=RuntimeError("send failed"))
+        with self.assertRaises(RuntimeError):
+            await self.plugin.on_message(event)
+        self.assertNotIn(self.plugin._key(event), self.plugin.pending)
+        self.assertNotIn(self.plugin._key(event), self.plugin.pending_languages)
+
     async def test_pending_quote_chain_selects_actual_file(self):
         await self.run_message(Plain("帮我翻译一下"))
         image = Image(url="https://example.invalid/a.png")
