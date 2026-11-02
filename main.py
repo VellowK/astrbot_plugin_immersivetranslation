@@ -13,7 +13,7 @@ from urllib.parse import unquote, urlsplit
 
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
-from astrbot.api.message_components import File, Image, Plain
+from astrbot.api.message_components import File, Image, Plain, Reply
 from astrbot.api.star import Context, Star
 from astrbot.core.utils.astrbot_path import get_astrbot_data_path
 
@@ -29,7 +29,7 @@ try:
 except ImportError:  # Python 3.10; installed by aiohttp on this Python version.
     from async_timeout import timeout
 
-PLUGIN_VERSION = "v0.2.2"
+PLUGIN_VERSION = "v0.2.3"
 FORMATS = {".pdf", ".png", ".jpg", ".jpeg", ".webp"}
 HELP = f"""沉浸式文档翻译 {PLUGIN_VERSION} · BabelDOC 开源引擎
 只发 PDF / 图片不会翻译。请说「翻译」「帮我翻译一下这个文件」或发送 /沉浸翻译；也可先请求、再发附件。
@@ -58,6 +58,8 @@ class ImmersiveTranslationPlugin(Star):
         self.pending: dict[tuple[str, str], float] = {}
         self.pending_languages: dict[tuple[str, str], str] = {}
         self.recent: dict[tuple[str, str], tuple[float, object]] = {}
+        # Exact message references, scoped to the observing user and session.
+        self.references: dict[tuple[tuple[str, str], str], tuple[float, object]] = {}
         self.jobs: dict[tuple[str, str], asyncio.Task] = {}
         self.active_directories: set[Path] = set()
         self.root = (
@@ -95,16 +97,101 @@ class ImmersiveTranslationPlugin(Star):
                 return bool(getattr(event, "is_at_or_wake_command", False))
         return True
 
-    def _attachments(self, event):
+    @staticmethod
+    def _file_parts(parts):
         return [
             part
-            for part in event.get_messages()
+            for part in parts
             if isinstance(part, Image)
             or (
                 isinstance(part, File)
                 and Path(safe_name(part.name or "")).suffix.lower() in FORMATS
             )
         ]
+
+    def _attachments(self, event):
+        return self._file_parts(event.get_messages())
+
+    @staticmethod
+    def _field(obj, name, default=None):
+        return obj.get(name, default) if isinstance(obj, dict) else getattr(obj, name, default)
+
+    def _raw(self, event):
+        message = getattr(event, "message_obj", None)
+        raw = self._field(message, "raw_message")
+        data = self._field(raw, "raw_data", {})
+        return data if isinstance(data, dict) else {}
+
+    def _scene_index(self, event, name):
+        scene = self._field(self._raw(event), "message_scene", {})
+        ext = self._field(scene, "ext", [])
+        if not isinstance(ext, list):
+            return ""
+        for item in ext:
+            if isinstance(item, str) and item.startswith(name + "="):
+                value = item[len(name) + 1 :]
+                return value if 0 < len(value) <= 512 else ""
+        return ""
+
+    def _remember_reference(self, event, attachment, expiry):
+        message = getattr(event, "message_obj", None)
+        ids = [self._field(message, "message_id"), self._scene_index(event, "msg_idx")]
+        for value in ids:
+            if value is None:
+                continue
+            value = str(value)
+            if not value or len(value) > 512:
+                continue
+            cache_key = (self._key(event), value)
+            if cache_key not in self.references and len(self.references) >= 512:
+                oldest = min(self.references, key=lambda k: self.references[k][0])
+                del self.references[oldest]
+            self.references[cache_key] = (expiry, attachment)
+
+    def _quoted(self, event):
+        """Return (has_quote, attachments); never fall back to a different recent file."""
+        replies = [part for part in event.get_messages() if isinstance(part, Reply)]
+        raw = self._raw(event)
+        ref = self._scene_index(event, "ref_msg_idx")
+        elements = raw.get("msg_elements", [])
+        first = elements[0] if isinstance(elements, list) and elements else {}
+        element_ref = self._field(first, "msg_idx", "")
+        if not replies and not ref:
+            return False, []
+        if len(replies) > 1:
+            return True, []
+        chain = getattr(replies[0], "chain", None) if replies else None
+        files = self._file_parts(chain) if isinstance(chain, (list, tuple)) else []
+        ids = {
+            str(value)
+            for value in (getattr(replies[0], "id", "") if replies else "", ref, element_ref)
+            if value is not None and str(value)
+        }
+        if any(len(value) > 512 for value in ids):
+            return True, []
+        resolved = [self.references.get((self._key(event), value)) for value in ids]
+        found = []
+        for cached in resolved:
+            if cached and all(item is not cached[1] for item in found):
+                found.append(cached[1])
+        # Different identifiers must not silently select different cached messages;
+        # multiple unresolvable identifiers are ambiguous even with one cache hit.
+        if len(found) > 1 or (len(ids) > 1 and any(item is None for item in resolved)):
+            return True, []
+        if files and found:
+            chain_url = getattr(files[0], "url", None)
+            cached_url = getattr(found[0], "url", None)
+            if len(files) != 1 or (chain_url and cached_url and chain_url != cached_url):
+                return True, []
+        return True, files or found
+
+    @staticmethod
+    def _selector(text):
+        return bool(
+            re.fullmatch(
+                r"(?:这个|这个文件|这个图片|这份|这份文件|这张|它|就是这个)[。！!\s]*", text
+            )
+        )
 
     def _prune(self):
         now = time.monotonic()
@@ -113,6 +200,7 @@ class ImmersiveTranslationPlugin(Star):
             key: language for key, language in self.pending_languages.items() if key in self.pending
         }
         self.recent = {key: item for key, item in self.recent.items() if item[0] > now}
+        self.references = {key: item for key, item in self.references.items() if item[0] > now}
 
     def _start_cleaner(self):
         if self.cleaner is None:
@@ -303,7 +391,14 @@ class ImmersiveTranslationPlugin(Star):
         )
         if not re.fullmatch(r"[A-Za-z]{2,3}(?:[-_][A-Za-z]{2,8})?", language):
             return "目标语言请使用语言代码，例如 zh、en、ja、zh-CN。"
-        if not attachments and key in self.recent:
+        quoted, quoted_files = self._quoted(event)
+        if attachments and quoted:
+            return "同时收到新附件和引用，无法确定要翻译哪一个；请只发送或引用一个文件。"
+        if not attachments and quoted:
+            attachments = quoted_files
+            if not attachments:
+                return "无法读取所引用的附件，可能是平台未提供文件或缓存已失效；请重新上传原 PDF 或图片。"
+        elif not attachments and key in self.recent:
             attachments = [self.recent[key][1]]
         if len(attachments) > 1:
             return "请一次只发送一个 PDF 或图片附件。"
@@ -363,8 +458,12 @@ class ImmersiveTranslationPlugin(Star):
             return language
         # A prior explicit request authorizes only the same user's next bare attachment,
         # not unrelated subsequent instructions, nor an attachment-free model tool call.
-        if not text and self._key(event) in self.pending and self._attachments(event):
-            return self.pending_languages.get(self._key(event), "")
+        if self._key(event) in self.pending:
+            quoted, _ = self._quoted(event)
+            if (not text and self._attachments(event)) or (
+                quoted and (not text or self._selector(text))
+            ):
+                return self.pending_languages.get(self._key(event), "")
         return None
 
     @filter.llm_tool(name="immersive_translate")
@@ -378,10 +477,10 @@ class ImmersiveTranslationPlugin(Star):
         if not self._allowed(event):
             return "当前用户或群聊不允许使用此工具。"
         text = self._text(event)
-        if text and requested_language(text) is None:
+        language = self._request(event)
+        if text and language is None:
             self.pending.pop(self._key(event), None)
             self.pending_languages.pop(self._key(event), None)
-        language = self._request(event)
         if language is None:
             return "尚未获得明确的文档翻译请求，不会启动引擎。请用户说「翻译这个文件」或发送 /沉浸翻译；只发附件不表示同意翻译。"
         return await self._launch(event, language or target_language)
@@ -434,17 +533,17 @@ class ImmersiveTranslationPlugin(Star):
             else:
                 await event.send(event.plain_result(HELP))
             return
-        if text and requested_language(text) is None:
+        language = self._request(event)
+        if text and language is None:
             self.pending.pop(key, None)
             self.pending_languages.pop(key, None)
         attachments = self._attachments(event)
         # This is an in-memory, same-user reference only: no download, installation,
         # model call, notification or event interception for an unsolicited attachment.
         if len(attachments) == 1 and (key in self.recent or len(self.recent) < 256):
-            self.recent[key] = (
-                time.monotonic() + integer(self.config, "recent_timeout", 120, 15, 600),
-                attachments[0],
-            )
+            expiry = time.monotonic() + integer(self.config, "recent_timeout", 120, 15, 600)
+            self.recent[key] = (expiry, attachments[0])
+            self._remember_reference(event, attachments[0], expiry)
         language = self._request(event)
         if language is not None:
             event.stop_event()
@@ -463,4 +562,5 @@ class ImmersiveTranslationPlugin(Star):
         self.pending.clear()
         self.pending_languages.clear()
         self.recent.clear()
+        self.references.clear()
         self._texts.clear()

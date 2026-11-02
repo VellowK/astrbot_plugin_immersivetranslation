@@ -35,6 +35,11 @@ class Plain:
         self.text = text
 
 
+class Reply:
+    def __init__(self, id="", chain=None):
+        self.id, self.chain = id, chain or []
+
+
 class Star:
     def __init__(self, context):
         self.context = context
@@ -99,7 +104,12 @@ def load_plugin():
         EventMessageType=types.SimpleNamespace(ALL="all"),
     )
     components = modules["astrbot.api.message_components"]
-    components.File, components.Image, components.Plain = File, Image, Plain
+    components.File, components.Image, components.Plain, components.Reply = (
+        File,
+        Image,
+        Plain,
+        Reply,
+    )
     modules["astrbot.api.star"].Context = object
     modules["astrbot.api.star"].Star = Star
     modules["astrbot.core.utils.astrbot_path"].get_astrbot_data_path = lambda: "."
@@ -156,6 +166,107 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         response = await self.plugin._launch(event)
         self.assertIn("已启动", response)
         return event, self.plugin.jobs[self.plugin._key(event)]
+
+    async def test_pending_quote_chain_selects_actual_file(self):
+        await self.run_message(Plain("帮我翻译一下"))
+        image = Image(url="https://example.invalid/a.png")
+        with patch.object(self.plugin, "_job", side_effect=self.hold_job) as job:
+            event = await self.run_message(Reply("old", [image]), Plain("这个"))
+            self.assertTrue(event.stopped)
+            self.assertIn("已启动", event.sent[0])
+            self.assertIs(job.call_args.args[1], image)
+
+    async def test_pending_quote_exact_qq_index_selects_not_latest(self):
+        first = self.event(self.attachment)
+        first.message_obj = types.SimpleNamespace(
+            message_id="ROBOT1",
+            raw_message=types.SimpleNamespace(
+                raw_data={"message_scene": {"ext": ["msg_idx=REFIDX_first", "auth_token=secret"]}}
+            ),
+        )
+        await self.plugin.on_message(first)
+        other = File("later.pdf", url="https://example.invalid/later.pdf")
+        await self.run_message(other)
+        # Simulate user explicitly requesting after the recent item has expired.
+        self.plugin.recent.clear()
+        await self.run_message(Plain("帮我翻译一下"))
+        event = self.event(Reply(""), Plain("这个"))
+        event.message_obj = types.SimpleNamespace(
+            raw_message=types.SimpleNamespace(
+                raw_data={
+                    "message_scene": {
+                        "ext": ["msg_idx=REFIDX_current", "ref_msg_idx=REFIDX_first"]
+                    },
+                    "msg_elements": [{"msg_idx": "REFIDX_first"}],
+                }
+            )
+        )
+        with patch.object(self.plugin, "_job", side_effect=self.hold_job) as job:
+            await self.plugin.on_message(event)
+            self.assertTrue(event.stopped)
+            self.assertIs(job.call_args.args[1], self.attachment)
+
+    async def test_unknown_quote_never_uses_recent_and_keeps_pending(self):
+        await self.run_message(Plain("帮我翻译一下"))
+        recent = self.event()
+        self.plugin.recent[self.plugin._key(recent)] = (float("inf"), self.attachment)
+        with patch.object(self.plugin, "_job", new_callable=AsyncMock) as job:
+            event = await self.run_message(Reply("missing"), Plain("这个"))
+            self.assertTrue(event.stopped)
+            self.assertIn("重新上传", event.sent[0])
+            self.assertIn(self.plugin._key(event), self.plugin.pending)
+            job.assert_not_called()
+            self.plugin.runtime.ensure.assert_not_awaited()
+
+    async def test_conflicting_quote_identifiers_never_select_cached_file(self):
+        original = self.event(self.attachment)
+        original.message_obj = types.SimpleNamespace(message_id="known")
+        await self.plugin.on_message(original)
+        self.plugin.recent.clear()
+        await self.run_message(Plain("翻译"))
+        for chain in ([], [File("different.pdf", url="https://example.invalid/different.pdf")]):
+            event = self.event(Reply("missing", chain), Plain("这个"))
+            event.message_obj = types.SimpleNamespace(
+                raw_message=types.SimpleNamespace(
+                    raw_data={
+                        "message_scene": {"ext": ["ref_msg_idx=known"]},
+                    }
+                )
+            )
+            with patch.object(self.plugin, "_job", new_callable=AsyncMock) as job:
+                await self.plugin.on_message(event)
+                self.assertIn("重新上传", event.sent[0])
+                job.assert_not_called()
+
+    async def test_direct_file_and_quote_are_ambiguous(self):
+        event = self.event(
+            Plain("翻译"), self.attachment, Reply("q", [Image(url="https://example.invalid/a.png")])
+        )
+        with patch.object(self.plugin, "_job", new_callable=AsyncMock) as job:
+            await self.plugin.on_message(event)
+            self.assertIn("无法确定", event.sent[0])
+            job.assert_not_called()
+
+    async def test_quote_does_not_authorize_without_pending(self):
+        with patch.object(self.plugin, "_job", new_callable=AsyncMock) as job:
+            event = await self.run_message(Reply("a", [self.attachment]), Plain("这个"))
+            self.assertFalse(event.stopped)
+            self.assertEqual(event.sent, [])
+            self.assertIn("明确", await self.plugin.immersive_translate(event))
+            job.assert_not_called()
+
+    async def test_reference_cache_is_scoped_to_user_and_session(self):
+        original = self.event(self.attachment)
+        original.message_obj = types.SimpleNamespace(message_id="old")
+        await self.plugin.on_message(original)
+        for user, session in (("bob", "private:alice"), ("alice", "other")):
+            await self.run_message(Plain("翻译"), user=user, session=session)
+            with patch.object(self.plugin, "_job", new_callable=AsyncMock) as job:
+                event = await self.run_message(
+                    Reply("old"), Plain("这个"), user=user, session=session
+                )
+                self.assertIn("重新上传", event.sent[0])
+                job.assert_not_called()
 
     async def test_recent_attachment_requires_same_user_and_session(self):
         self.plugin.config["auto_translate_attachment"] = False
