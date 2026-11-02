@@ -7,6 +7,7 @@ import re
 import shutil
 import time
 import uuid
+import weakref
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
@@ -28,10 +29,11 @@ try:
 except ImportError:  # Python 3.10; installed by aiohttp on this Python version.
     from async_timeout import timeout
 
+PLUGIN_VERSION = "v0.2.2"
 FORMATS = {".pdf", ".png", ".jpg", ".jpeg", ".webp"}
-HELP = """沉浸式文档翻译 · BabelDOC 开源引擎
+HELP = f"""沉浸式文档翻译 {PLUGIN_VERSION} · BabelDOC 开源引擎
 只发 PDF / 图片不会翻译。请说「翻译」「帮我翻译一下这个文件」或发送 /沉浸翻译；也可先请求、再发附件。
-/沉浸翻译 帮助 · /沉浸翻译 状态 · /沉浸翻译 取消
+/沉浸翻译 帮助 · /沉浸翻译 状态 · /沉浸翻译 版本 · /沉浸翻译 取消
 支持模型工具 immersive_translate，使用当前或同一用户最近发送的附件，不接受任意路径。
 默认英→中，返回译文及双语 PDF。图片和扫描件需开启可选 OCR，仅适合清晰黑字白底，图片输出为 PDF。
 使用 AstrBot 当前文本模型，会产生模型费用；原文发送至该模型服务。原文件不覆盖，不保证无损排版。
@@ -50,6 +52,9 @@ class ImmersiveTranslationPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
         self.config = config
+        # Weak event keys retain neither old messages nor their attachments indefinitely.
+        # Freeze text before downstream tool processing can rewrite Plain components.
+        self._texts = weakref.WeakKeyDictionary()
         self.pending: dict[tuple[str, str], float] = {}
         self.pending_languages: dict[tuple[str, str], str] = {}
         self.recent: dict[tuple[str, str], tuple[float, object]] = {}
@@ -65,6 +70,12 @@ class ImmersiveTranslationPlugin(Star):
         self.cleaner = None
         self.closing = False
         self.runtime = EngineRuntime(self.root.parent)
+        # Server-side only: enables administrators to identify duplicate/old copies.
+        logger.info(
+            "沉浸翻译已加载：%s；策略=仅明确请求；入口=%s",
+            PLUGIN_VERSION,
+            str(Path(__file__).resolve()),
+        )
 
     def _key(self, event):
         return event.unified_msg_origin, str(event.get_sender_id())
@@ -249,7 +260,7 @@ class ImmersiveTranslationPlugin(Star):
         except asyncio.CancelledError:
             raise
         except TranslationError as exc:
-            await event.send(event.plain_result(str(exc)))
+            await event.send(event.plain_result(f"沉浸翻译 {PLUGIN_VERSION}：{exc}"))
         except Exception as exc:
             logger.error("沉浸翻译失败：%s", type(exc).__name__)
             try:
@@ -270,13 +281,23 @@ class ImmersiveTranslationPlugin(Star):
         if self.closing:
             return "插件正在卸载。"
         self._prune()
+        explicit = bool(re.fullmatch(r"/?沉浸翻译(?:\s+(?:翻译|开始))?", self._text(event)))
+        if not self._allowed(event, explicit=explicit):
+            return "当前用户或群聊不允许翻译。"
+        consent = self._request(event)
+        if consent is None:
+            return (
+                "尚未获得明确的文档翻译请求，不会启动引擎。请说「翻译这个文件」或发送 /沉浸翻译。"
+            )
+        # This gate is shared by EVERY job dispatch, including direct/internal calls.
         self._start_cleaner()
         if self.jobs:
             return "已有翻译任务正在运行，请稍后重试（不排队）。"
         attachments = self._attachments(event)
         key = self._key(event)
         language = (
-            target
+            consent
+            or target
             or self.pending_languages.get(key)
             or str(self.config.get("target_language", "zh"))
         )
@@ -301,7 +322,12 @@ class ImmersiveTranslationPlugin(Star):
         task = asyncio.create_task(self._job(event, attachments[0], language, directory))
         self.jobs[key] = task
         task.add_done_callback(lambda finished: self._task_done(key, directory, finished))
-        return "翻译任务已启动；首次使用将自动联网准备引擎。完成后自动发送译本；/沉浸翻译 状态 可查看，/沉浸翻译 取消 可中止。原文会发送至配置的模型并可能计费。"
+        logger.info(
+            "沉浸翻译授权启动：%s；来源=%s",
+            PLUGIN_VERSION,
+            "当前明确请求" if self._text(event) else "先前明确请求的后续附件",
+        )
+        return f"沉浸翻译 {PLUGIN_VERSION}：翻译任务已启动；首次使用将自动联网准备引擎。完成后自动发送译本；/沉浸翻译 状态 可查看，/沉浸翻译 取消 可中止。原文会发送至配置的模型并可能计费。"
 
     def _task_done(self, key, directory, task):
         if self.jobs.get(key) is task:
@@ -316,10 +342,19 @@ class ImmersiveTranslationPlugin(Star):
                 logger.error("沉浸翻译后台任务异常：%s", type(error).__name__)
 
     def _text(self, event):
-        # Read only actual message text, never filenames or attachment/document contents.
-        return "".join(
-            part.text for part in event.get_messages() if isinstance(part, Plain)
-        ).strip()
+        # Freeze the first observed message; a later Plain('翻译') injected by a
+        # pipeline/plugin must not turn an unsolicited image into user consent.
+        if event not in self._texts:
+            text = "".join(
+                part.text for part in event.get_messages() if isinstance(part, Plain)
+            ).strip()
+            # AstrMessageEvent.message_str is the adapter's plain-text message.
+            # A known-empty original also fails closed if a tool runs first.
+            original = getattr(event, "message_str", None)
+            if isinstance(original, str) and not original.strip():
+                text = ""
+            self._texts[event] = text
+        return self._texts[event]
 
     def _request(self, event):
         text = self._text(event)
@@ -377,12 +412,21 @@ class ImmersiveTranslationPlugin(Star):
                         "已取消等待或当前任务。已发出的文件不能撤回；模型调用可能已计费。"
                     )
                 )
+            elif argument in {"版本", "version"}:
+                await event.send(
+                    event.plain_result(
+                        f"沉浸式文档翻译 {PLUGIN_VERSION}；触发策略：仅明确请求。"
+                        "裸 PDF/图片不会自动启动；模型工具不能代替用户授权。"
+                    )
+                )
             elif argument in {"状态", "status"}:
                 # Both modes are read-only: imports/self-checks can create
                 # upstream caches, so only a translation may start an interpreter.
                 await event.send(
                     event.plain_result(
-                        self.runtime.describe(self.config) + f"；运行任务：{len(self.jobs)}。"
+                        f"沉浸式文档翻译 {PLUGIN_VERSION}；触发策略：仅明确请求；"
+                        + self.runtime.describe(self.config)
+                        + f"；运行任务：{len(self.jobs)}；当前用户等待附件：{'是' if key in self.pending else '否'}。"
                     )
                 )
             elif argument in {"", "翻译", "开始"}:
@@ -419,3 +463,4 @@ class ImmersiveTranslationPlugin(Star):
         self.pending.clear()
         self.pending_languages.clear()
         self.recent.clear()
+        self._texts.clear()

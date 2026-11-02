@@ -43,6 +43,7 @@ class Star:
 class FakeEvent:
     def __init__(self, parts=(), *, user="alice", session="private:alice", group="", at=False):
         self.parts = list(parts)
+        self.message_str = "".join(part.text for part in self.parts if isinstance(part, Plain))
         self.user, self.group = user, group
         self.unified_msg_origin = session
         self.is_at_or_wake_command = at
@@ -148,7 +149,7 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.Event().wait()
 
     async def launch_blocked_job(self, event=None):
-        event = event or self.event(self.attachment)
+        event = event or self.event(Plain("翻译"), self.attachment)
         job_patch = patch.object(self.plugin, "_job", side_effect=self.hold_job)
         job_patch.start()
         self.addCleanup(job_patch.stop)
@@ -174,7 +175,7 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(self.plugin._key(original), self.plugin.recent)
 
     async def test_current_attachment_takes_precedence_over_recent(self):
-        event = self.event(self.attachment)
+        event = self.event(Plain("翻译"), self.attachment)
         old = File("old.pdf", url="https://example.invalid/old.pdf")
         self.plugin.recent[self.plugin._key(event)] = (float("inf"), old)
         with patch.object(self.plugin, "_job", side_effect=self.hold_job) as job:
@@ -182,7 +183,7 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
             self.assertIs(job.call_args.args[1], self.attachment)
 
     async def test_expired_recent_attachment_is_not_reused(self):
-        event = self.event()
+        event = self.event(Plain("翻译"))
         self.plugin.recent[self.plugin._key(event)] = (0, self.attachment)
         self.assertIn("120秒", await self.plugin._launch(event))
         self.assertFalse(self.plugin.jobs)
@@ -214,6 +215,68 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
                     self.assertIn(self.plugin._key(event), self.plugin.recent)
         self.plugin.runtime.ensure.assert_not_awaited()
         self.assertEqual(list(self.plugin.root.iterdir()), [])
+
+    async def test_final_launch_gate_rejects_unrequested_images_and_internal_calls(self):
+        self.plugin.config["auto_translate_attachment"] = True
+        for parts in (
+            (),
+            (self.attachment,),
+            (Image(file="photo.png"),),
+            (Plain("帮我总结这个图片"), Image(file="photo.png")),
+            (File("翻译.pdf"),),
+        ):
+            with self.subTest(parts=parts):
+                response = await self.plugin._launch(self.event(*parts), "zh")
+                self.assertIn("明确", response)
+        self.plugin.runtime.ensure.assert_not_awaited()
+        self.plugin._start_cleaner.assert_not_called()
+        self.assertFalse(self.plugin.pending)
+        self.assertFalse(self.plugin.jobs)
+        self.assertEqual(list(self.plugin.root.iterdir()), [])
+
+    async def test_later_plain_or_message_string_injection_cannot_authorize_image(self):
+        event = await self.run_message(Image(file="photo.png"))
+        event.parts.insert(0, Plain("翻译"))
+        event.message_str = "翻译"
+        with patch.object(self.plugin, "_job", new_callable=AsyncMock) as job:
+            self.assertIn("明确", await self.plugin.immersive_translate(event, "ja"))
+            self.assertIn("明确", await self.plugin._launch(event, "ja"))
+            await self.plugin.on_message(event)
+        job.assert_not_called()
+        self.plugin.runtime.ensure.assert_not_awaited()
+        self.assertFalse(event.stopped)
+        self.assertEqual(event.sent, [])
+        self.assertFalse(self.plugin.pending)
+        self.assertFalse(self.plugin.jobs)
+
+    async def test_tool_first_rejects_plain_injected_into_originally_empty_image(self):
+        event = self.event(Image(file="photo.png"))
+        event.parts.insert(0, Plain("翻译"))
+        with patch.object(self.plugin, "_job", new_callable=AsyncMock) as job:
+            self.assertIn("明确", await self.plugin.immersive_translate(event, "ja"))
+        job.assert_not_called()
+        self.assertFalse(self.plugin.pending)
+        self.assertFalse(self.plugin.jobs)
+        self.assertEqual(event.sent, [])
+
+    async def test_version_help_and_status_identify_running_code_without_install(self):
+        for action in ("版本", "状态", "帮助"):
+            with self.subTest(action=action):
+                event = await self.run_message(Plain("/沉浸翻译 " + action))
+                self.assertIn(plugin_module.PLUGIN_VERSION, event.sent[0])
+        self.plugin.runtime.ensure.assert_not_awaited()
+        self.plugin._start_cleaner.assert_not_called()
+        self.assertFalse(self.plugin.pending)
+        self.assertFalse(self.plugin.jobs)
+        self.assertEqual(list(self.plugin.root.iterdir()), [])
+
+    async def test_image_explicit_request_still_starts_with_running_version(self):
+        with patch.object(self.plugin, "_job", side_effect=self.hold_job) as job:
+            event = await self.run_message(Plain("翻译这个图片"), Image(file="photo.png"))
+        self.assertTrue(event.stopped)
+        self.assertEqual(job.call_count, 1)
+        self.assertIn(plugin_module.PLUGIN_VERSION, event.sent[0])
+        self.assertIn("已启动", event.sent[0])
 
     async def test_natural_requests_launch_with_requested_language(self):
         for text, language in (
@@ -375,7 +438,7 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_pending_and_recent_have_capacity_limits(self):
         self.plugin.pending = {(f"s{i}", "user"): float("inf") for i in range(256)}
-        event = self.event()
+        event = self.event(Plain("翻译"))
         self.assertIn("过多", await self.plugin._launch(event))
         self.assertEqual(len(self.plugin.pending), 256)
         self.plugin.config["auto_translate_attachment"] = False
@@ -447,7 +510,8 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_multiple_attachments_do_not_start_job(self):
         self.assertIn(
-            "一次只", await self.plugin._launch(self.event(self.attachment, Image(file="x")))
+            "一次只",
+            await self.plugin._launch(self.event(Plain("翻译"), self.attachment, Image(file="x"))),
         )
         self.assertFalse(self.plugin.jobs)
         self.assertFalse(self.plugin.active_directories)
@@ -467,7 +531,7 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_invalid_language_does_not_create_job_or_consume_recent(self):
-        event = self.event()
+        event = self.event(Plain("翻译"))
         self.plugin.recent[self.plugin._key(event)] = (float("inf"), self.attachment)
         for target in ("../../secret", "en\n--flag", "", "x" * 100):
             if not target:
@@ -481,7 +545,9 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
     async def test_single_global_job_no_queue_even_for_different_user(self):
         event, task = await self.launch_blocked_job()
         directory = next(iter(self.plugin.active_directories))
-        result = await self.plugin._launch(self.event(self.attachment, user="bob", session="other"))
+        result = await self.plugin._launch(
+            self.event(Plain("翻译"), self.attachment, user="bob", session="other")
+        )
         self.assertIn("正在运行", result)
         self.assertEqual(self.plugin.jobs, {self.plugin._key(event): task})
         self.assertEqual(self.plugin.active_directories, {directory})
@@ -697,7 +763,9 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_job_translation_error_is_shown_and_credentials_removed(self):
         event, _, _ = await self.run_real_job(error=TranslationError("safe actionable error"))
-        self.assertEqual(event.sent, ["safe actionable error"])
+        self.assertEqual(
+            event.sent, [f"沉浸翻译 {plugin_module.PLUGIN_VERSION}：safe actionable error"]
+        )
 
     async def test_job_unexpected_error_does_not_leak_exception_secrets(self):
         with self.assertLogs("immersive.tests", level="ERROR"):
@@ -753,7 +821,9 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
             await self.plugin._job(event, self.attachment, "zh", directory)
         bridge.assert_not_called()
         source.assert_not_awaited()
-        self.assertEqual(event.sent, ["引擎下载失败，请检查网络。"])
+        self.assertEqual(
+            event.sent, [f"沉浸翻译 {plugin_module.PLUGIN_VERSION}：引擎下载失败，请检查网络。"]
+        )
         self.assertFalse((directory / "request.json").exists())
         self.assertFalse(self.plugin.jobs)
 
@@ -770,7 +840,7 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
 
         self.plugin.runtime.ensure.side_effect = ensure
         with patch.object(plugin_module, "ModelBridge") as bridge:
-            event = self.event(self.attachment)
+            event = self.event(Plain("翻译"), self.attachment)
             await self.plugin._launch(event)
             await entered.wait()
             reply = await self.run_message(Plain("/沉浸翻译 取消"))
